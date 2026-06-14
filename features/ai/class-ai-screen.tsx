@@ -1,12 +1,12 @@
 "use client"
 
-import { ArrowDown, Bot, Loader2, Send } from "lucide-react"
+import { ArrowDown, Bot, Loader2, Send, Trash2 } from "lucide-react"
 import { type FormEvent, useEffect, useRef, useState } from "react"
 import { ClassPageHeader } from "@/components/shared/class-page-header"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
-import type { Class } from "@/lib/mock-data"
 import { toast } from "@/hooks/use-toast"
+import type { Class } from "@/lib/mock-data"
 import { cn } from "@/lib/utils"
 import { MarkdownContent } from "./markdown-content"
 
@@ -16,11 +16,177 @@ type AgentMessage = {
   content: string
 }
 
+type PendingAgentRequest = {
+  requestId: string
+}
+
+const AGENT_CHAT_STORAGE_PREFIX = "eduverse:agent-chat:v1"
+const pendingAgentRequests = new Map<string, PendingAgentRequest>()
+const pendingAgentErrors = new Map<string, string>()
+const agentChatListeners = new Map<string, Set<() => void>>()
+
 const SUGGESTED_PROMPTS = [
   "Summarize what I should study this week.",
   "Make a short quiz from our recent materials.",
   "Explain the hardest current assignment step by step.",
 ]
+
+function getAgentChatStorageKey(classId: string) {
+  return `${AGENT_CHAT_STORAGE_PREFIX}:${classId}`
+}
+
+function notifyAgentChatListeners(classId: string) {
+  const listeners = agentChatListeners.get(classId)
+  if (!listeners) return
+
+  for (const listener of listeners) {
+    listener()
+  }
+}
+
+function subscribeToAgentChat(classId: string, listener: () => void) {
+  const listeners = agentChatListeners.get(classId) ?? new Set<() => void>()
+  listeners.add(listener)
+  agentChatListeners.set(classId, listeners)
+
+  return () => {
+    listeners.delete(listener)
+    if (listeners.size === 0) {
+      agentChatListeners.delete(classId)
+    }
+  }
+}
+
+function hasPendingAgentRequest(classId: string) {
+  return pendingAgentRequests.has(classId)
+}
+
+function consumePendingAgentError(classId: string) {
+  const errorMessage = pendingAgentErrors.get(classId) ?? null
+  pendingAgentErrors.delete(classId)
+  return errorMessage
+}
+
+function loadStoredAgentMessages(classId: string): AgentMessage[] {
+  if (typeof window === "undefined") return []
+
+  try {
+    const raw = window.localStorage.getItem(getAgentChatStorageKey(classId))
+    if (!raw) return []
+
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+
+    return parsed.filter((item): item is AgentMessage => {
+      if (!item || typeof item !== "object") return false
+
+      return (
+        typeof item.id === "string" &&
+        (item.role === "user" || item.role === "assistant") &&
+        typeof item.content === "string"
+      )
+    })
+  } catch {
+    return []
+  }
+}
+
+function saveStoredAgentMessages(classId: string, messages: AgentMessage[]) {
+  if (typeof window === "undefined") return
+
+  try {
+    const storageKey = getAgentChatStorageKey(classId)
+
+    if (messages.length === 0) {
+      window.localStorage.removeItem(storageKey)
+      return
+    }
+
+    window.localStorage.setItem(storageKey, JSON.stringify(messages))
+  } catch {
+    console.error("Failed to save AI Agent chat to localStorage")
+  }
+}
+
+function clearStoredAgentMessages(classId: string) {
+  if (typeof window === "undefined") return
+
+  try {
+    window.localStorage.removeItem(getAgentChatStorageKey(classId))
+  } catch {
+    console.error("Failed to clear AI Agent chat from localStorage")
+  }
+}
+
+function cancelPendingAgentRequest(classId: string) {
+  pendingAgentRequests.delete(classId)
+  pendingAgentErrors.delete(classId)
+}
+
+function startAgentRequest(
+  classId: string,
+  question: string,
+  priorMessages: AgentMessage[],
+) {
+  if (hasPendingAgentRequest(classId)) return
+
+  const requestId = crypto.randomUUID()
+  const nextMessages: AgentMessage[] = [
+    ...priorMessages,
+    { id: crypto.randomUUID(), role: "user", content: question },
+  ]
+
+  saveStoredAgentMessages(classId, nextMessages)
+  pendingAgentRequests.set(classId, { requestId })
+  notifyAgentChatListeners(classId)
+
+  void fetch(`/api/classes/${encodeURIComponent(classId)}/ai/agent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      question,
+      messages: priorMessages,
+    }),
+  })
+    .then(async (response) => {
+      const payload = (await response.json().catch(() => null)) as {
+        answer?: string
+        error?: string
+      } | null
+
+      const answer = payload?.answer
+
+      if (!response.ok || !answer) {
+        throw new Error(payload?.error ?? "Could not ask AI Agent.")
+      }
+
+      const activeRequest = pendingAgentRequests.get(classId)
+      if (activeRequest?.requestId !== requestId) return
+
+      saveStoredAgentMessages(classId, [
+        ...loadStoredAgentMessages(classId),
+        { id: crypto.randomUUID(), role: "assistant", content: answer },
+      ])
+    })
+    .catch((error) => {
+      const activeRequest = pendingAgentRequests.get(classId)
+      if (activeRequest?.requestId !== requestId) return
+
+      saveStoredAgentMessages(classId, priorMessages)
+      pendingAgentErrors.set(
+        classId,
+        error instanceof Error ? error.message : "Could not ask AI Agent.",
+      )
+    })
+    .finally(() => {
+      const activeRequest = pendingAgentRequests.get(classId)
+      if (activeRequest?.requestId === requestId) {
+        pendingAgentRequests.delete(classId)
+      }
+
+      notifyAgentChatListeners(classId)
+    })
+}
 
 export function ClassAiScreen({ cls }: { cls: Class }) {
   const [input, setInput] = useState("")
@@ -50,6 +216,43 @@ export function ClassAiScreen({ cls }: { cls: Class }) {
       behavior: "smooth",
     })
   }
+
+  function clearChat() {
+    cancelPendingAgentRequest(cls.id)
+    setMessages([])
+    setIsSending(false)
+    clearStoredAgentMessages(cls.id)
+    setCanScrollDown(false)
+    notifyAgentChatListeners(cls.id)
+  }
+
+  useEffect(() => {
+    function syncAgentChatState() {
+      setMessages(loadStoredAgentMessages(cls.id))
+      setIsSending(hasPendingAgentRequest(cls.id))
+
+      const pendingError = consumePendingAgentError(cls.id)
+      if (pendingError) {
+        setErrorMessage(pendingError)
+      }
+    }
+
+    syncAgentChatState()
+    const unsubscribe = subscribeToAgentChat(cls.id, syncAgentChatState)
+
+    function syncStoredAgentChat(event: StorageEvent) {
+      if (event.key === getAgentChatStorageKey(cls.id)) {
+        syncAgentChatState()
+      }
+    }
+
+    window.addEventListener("storage", syncStoredAgentChat)
+
+    return () => {
+      unsubscribe()
+      window.removeEventListener("storage", syncStoredAgentChat)
+    }
+  }, [cls.id])
 
   useEffect(() => {
     const inputElement = inputRef.current
@@ -89,50 +292,9 @@ export function ClassAiScreen({ cls }: { cls: Class }) {
     const question = rawQuestion.trim()
     if (!question || isSending) return
 
-    const nextMessages: AgentMessage[] = [
-      ...messages,
-      { id: crypto.randomUUID(), role: "user", content: question },
-    ]
-    setMessages(nextMessages)
     setInput("")
-    setIsSending(true)
     setErrorMessage(null)
-
-    try {
-      const response = await fetch(
-        `/api/classes/${encodeURIComponent(cls.id)}/ai/agent`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            question,
-            messages,
-          }),
-        },
-      )
-      const payload = (await response.json().catch(() => null)) as {
-        answer?: string
-        error?: string
-      } | null
-
-      const answer = payload?.answer
-
-      if (!response.ok || !answer) {
-        throw new Error(payload?.error ?? "Could not ask AI Agent.")
-      }
-
-      setMessages((prev) => [
-        ...prev,
-        { id: crypto.randomUUID(), role: "assistant", content: answer },
-      ])
-    } catch (error) {
-      setMessages(messages)
-      setErrorMessage(
-        error instanceof Error ? error.message : "Could not ask AI Agent.",
-      )
-    } finally {
-      setIsSending(false)
-    }
+    startAgentRequest(cls.id, question, messages)
   }
 
   async function submitQuestion(event?: FormEvent<HTMLFormElement>) {
@@ -144,6 +306,18 @@ export function ClassAiScreen({ cls }: { cls: Class }) {
     <div className="mx-auto flex h-[calc(100vh-3.5rem)] max-w-6xl flex-col p-6">
       <div className="mb-5 flex items-center justify-between gap-4">
         <ClassPageHeader title={cls.name} code={cls.code} section="AI Agent" />
+        {hasMessages ? (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={clearChat}
+            disabled={isSending}
+          >
+            <Trash2 className="h-4 w-4" />
+            Clear
+          </Button>
+        ) : null}
       </div>
 
       <div className="relative min-h-0 flex-1">
